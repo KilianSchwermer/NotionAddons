@@ -6,9 +6,339 @@
     <link rel="stylesheet" href="main.css">
 </head>
 <body>
+<main class="app" role="application" aria-labelledby="app-title">
+    <header>
+        <div>
+            <div id="app-title" class="title">Pomodoro Timer</div>
+            <div class="sub">Plain CSS · HTML · JS — lokal speichert · Benachrichtigungen · Töne · Shortcuts</div>
+        </div>
+        <div class="modes" role="tablist" aria-label="Modi">
+            <button class="mode-btn" role="tab" data-mode="focus" aria-pressed="true">Fokus</button>
+            <button class="mode-btn" role="tab" data-mode="short">Kurzpause</button>
+            <button class="mode-btn" role="tab" data-mode="long">Langpause</button>
+        </div>
+    </header>
 
-  <div class="container" id="container_button_settings">
-      <a href="settings.html" class="button" id="a_settings">Einstellungen</a>
-  </div>
+    <section class="panel timer" aria-live="polite">
+        <div class="time" id="time" aria-label="Restzeit">25:00</div>
+        <div class="cycle" id="cycle">Pomodoro 1 · Runde 1/4</div>
+        <div class="controls">
+            <button id="startPause" class="btn" aria-pressed="false">Start</button>
+            <button id="skip" class="btn secondary">Überspringen</button>
+            <button id="reset" class="btn danger">Reset</button>
+        </div>
+    </section>
+
+    <details class="panel settings">
+        <summary><strong>Einstellungen</strong><span class="hint">(werden lokal gespeichert)</span></summary>
+        <div class="grid">
+            <label>Fokus (Minuten)
+                <input id="focusMin" type="number" min="1" max="180" step="1" value="25" />
+            </label>
+            <label>Kurzpause (Minuten)
+                <input id="shortMin" type="number" min="1" max="60" step="1" value="5" />
+            </label>
+            <label>Langpause (Minuten)
+                <input id="longMin" type="number" min="1" max="60" step="1" value="15" />
+            </label>
+            <label>Runden bis Langpause
+                <input id="rounds" type="number" min="1" max="12" step="1" value="4" />
+            </label>
+            <label>Auto‑Start nächster Abschnitt
+                <select id="autoStart">
+                    <option value="off">Aus</option>
+                    <option value="on" selected>An</option>
+                </select>
+            </label>
+            <label>Ton bei Abschnittsende
+                <select id="sound">
+                    <option value="chime" selected>Chime (WebAudio)</option>
+                    <option value="off">Aus</option>
+                </select>
+            </label>
+            <label>Desktop‑Benachrichtigung
+                <select id="notify">
+                    <option value="off">Aus</option>
+                    <option value="on" selected>An</option>
+                </select>
+            </label>
+        </div>
+    </details>
+
+    <footer>
+        <div>Shortcuts: <span class="kbd">Leertaste</span> Start/Pause · <span class="kbd">R</span> Reset · <span class="kbd">N</span> Nächster</div>
+        <div>© <span id="year"></span> Pomodoro Vanilla</div>
+    </footer>
+</main>
+
+<script>
+	// ======= State =======
+	const $ = sel => document.querySelector(sel);
+	const timeEl = $('#time');
+	const cycleEl = $('#cycle');
+	const startPauseBtn = $('#startPause');
+	const skipBtn = $('#skip');
+	const resetBtn = $('#reset');
+	const modeButtons = [...document.querySelectorAll('.mode-btn')];
+
+	const inputs = {
+		focusMin: $('#focusMin'),
+		shortMin: $('#shortMin'),
+		longMin:  $('#longMin'),
+		rounds:   $('#rounds'),
+		autoStart:$('#autoStart'),
+		sound:    $('#sound'),
+		notify:   $('#notify'),
+	};
+
+	const STORAGE_KEY = 'pomodoro.settings.v1';
+
+	const defaultSettings = {
+		focusMin: 25,
+		shortMin: 5,
+		longMin: 15,
+		rounds: 4,
+		autoStart: 'on',
+		sound: 'chime',
+		notify: 'on'
+	};
+
+	let settings = loadSettings();
+	applySettingsToInputs(settings);
+
+	let state = {
+		mode: 'focus', // 'focus' | 'short' | 'long'
+		round: 1,      // 1..settings.rounds
+		cycle: 1,      // Pomodoro‑Zyklus Zähler
+		running: false,
+		startAt: null, // realer Startzeitpunkt (ms)
+		endAt: null,   // geplanter Endzeitpunkt (ms)
+	};
+
+	function loadSettings(){
+		try{ return { ...defaultSettings, ...JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') }; }
+		catch{ return {...defaultSettings}; }
+	}
+	function saveSettings(){ localStorage.setItem(STORAGE_KEY, JSON.stringify(readInputs())); }
+	function applySettingsToInputs(s){
+		for(const k in inputs){
+			if(inputs[k].tagName === 'SELECT') inputs[k].value = s[k];
+			else inputs[k].value = s[k];
+		}
+	}
+	function readInputs(){
+		return {
+			focusMin: +inputs.focusMin.value || defaultSettings.focusMin,
+			shortMin: +inputs.shortMin.value || defaultSettings.shortMin,
+			longMin:  +inputs.longMin.value  || defaultSettings.longMin,
+			rounds:   Math.max(1, Math.min(12, +inputs.rounds.value||defaultSettings.rounds)),
+			autoStart: inputs.autoStart.value,
+			sound: inputs.sound.value,
+			notify: inputs.notify.value,
+		};
+	}
+
+	// Reflect initial UI
+	updateCycleLabel();
+	setTimeDisplay(minutesToMs(settings.focusMin));
+	document.getElementById('year').textContent = new Date().getFullYear();
+
+	// ======= Timer Engine (wall‑clock accurate) =======
+	let rafId = null;
+	function startTimer(){
+		if(state.running) return;
+		settings = readInputs(); saveSettings();
+		const duration = modeDurationMs(state.mode);
+		const now = Date.now();
+		if(!state.startAt || !state.endAt){
+			state.startAt = now; state.endAt = now + duration;
+		} else if(now > state.endAt){ // if expired while paused
+			state.endAt = now + 10; // trigger immediate finish
+		}
+		state.running = true;
+		startPauseBtn.textContent = 'Pause';
+		startPauseBtn.setAttribute('aria-pressed','true');
+		tick();
+	}
+	function pauseTimer(){
+		if(!state.running) return;
+		state.running = false;
+		cancelAnimationFrame(rafId);
+		// freeze remaining time
+		const remaining = Math.max(0, state.endAt - Date.now());
+		state.startAt = null; state.endAt = Date.now() + remaining; // keep remaining
+		startPauseBtn.textContent = 'Start';
+		startPauseBtn.setAttribute('aria-pressed','false');
+		setTimeDisplay(remaining);
+	}
+	function resetTimer(){
+		state.running = false; cancelAnimationFrame(rafId);
+		state.startAt = null; state.endAt = null;
+		setTimeDisplay(modeDurationMs(state.mode));
+		startPauseBtn.textContent = 'Start';
+		startPauseBtn.setAttribute('aria-pressed','false');
+	}
+	function tick(){
+		if(!state.running){ cancelAnimationFrame(rafId); return; }
+		const now = Date.now();
+		const remaining = Math.max(0, state.endAt - now);
+		setTimeDisplay(remaining);
+		if(remaining <= 0){
+			finishPhase();
+			return;
+		}
+		rafId = requestAnimationFrame(tick);
+	}
+
+	function finishPhase(){
+		state.running = false; cancelAnimationFrame(rafId);
+		startPauseBtn.textContent = 'Start';
+		startPauseBtn.setAttribute('aria-pressed','false');
+		setTimeDisplay(0);
+		chime();
+		notify(`${labelForMode(state.mode)} beendet`, nextModePreview());
+		advanceState();
+		updateCycleLabel();
+		highlightMode(state.mode);
+		setTimeDisplay(modeDurationMs(state.mode));
+		if(readInputs().autoStart === 'on') startTimer();
+	}
+
+	function advanceState(){
+		if(state.mode === 'focus'){
+			if(state.round < readInputs().rounds){
+				state.mode = 'short';
+			} else {
+				state.mode = 'long';
+			}
+		} else if(state.mode === 'short'){
+			state.mode = 'focus';
+			state.round += 1;
+		} else if(state.mode === 'long'){
+			state.mode = 'focus';
+			state.round = 1; // reset rounds
+			state.cycle += 1;
+		}
+	}
+
+	function modeDurationMs(mode){
+		const m = readInputs();
+		return minutesToMs(mode==='focus'?m.focusMin:mode==='short'?m.shortMin:m.longMin);
+	}
+
+	function labelForMode(mode){
+		return mode==='focus'? 'Fokus' : (mode==='short'? 'Kurzpause' : 'Langpause');
+	}
+
+	function nextModePreview(){
+		const snapshot = {...state};
+		// simulate progressive step to describe next phase
+		let next = '';
+		if(snapshot.mode==='focus') next = snapshot.round < readInputs().rounds ? 'Kurzpause' : 'Langpause';
+		else next = 'Fokus';
+		return `Als Nächstes: ${next}`;
+	}
+
+	function setTimeDisplay(ms){
+		const totalSec = Math.ceil(ms/1000);
+		const mm = Math.floor(totalSec/60).toString().padStart(2,'0');
+		const ss = (totalSec%60).toString().padStart(2,'0');
+		timeEl.textContent = `${mm}:${ss}`;
+		document.title = `${mm}:${ss} · ${labelForMode(state.mode)} – Pomodoro`;
+	}
+
+	function updateCycleLabel(){
+		const rounds = readInputs().rounds;
+		const label = state.mode==='focus' ? `Pomodoro ${state.cycle} · Runde ${state.round}/${rounds}`
+			: state.mode==='short' ? `Kurzpause · Runde ${state.round}/${rounds}`
+				: `Langpause · Abschluss Runde ${rounds}/${rounds}`;
+		cycleEl.textContent = label;
+	}
+
+	function highlightMode(mode){
+		modeButtons.forEach(btn => btn.setAttribute('aria-pressed', String(btn.dataset.mode===mode)));
+	}
+
+	// ======= Sound (WebAudio) =======
+	let audioCtx;
+	function chime(){
+		if(readInputs().sound==='off') return;
+		try{
+			audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
+			const now = audioCtx.currentTime;
+			const o = audioCtx.createOscillator();
+			const g = audioCtx.createGain();
+			o.type = 'sine';
+			o.frequency.setValueAtTime(880, now);
+			g.gain.setValueAtTime(0.0001, now);
+			g.gain.exponentialRampToValueAtTime(0.2, now + 0.02);
+			g.gain.exponentialRampToValueAtTime(0.0001, now + 1.0);
+			o.connect(g).connect(audioCtx.destination);
+			o.start(now);
+			o.stop(now + 1.05);
+		}catch{ /* no‑op */ }
+	}
+
+	// ======= Notifications =======
+	if(Notification && Notification.permission === 'default'){
+		// ask early so the first finish can notify
+		document.addEventListener('click', onceAskPermission, {once:true});
+	}
+	function onceAskPermission(){
+		if(readInputs().notify==='on' && Notification && Notification.permission==='default'){
+			Notification.requestPermission();
+		}
+	}
+	function notify(title, body){
+		if(readInputs().notify!=='on' || !('Notification' in window)) return;
+		if(Notification.permission === 'granted'){
+			const n = new Notification(title, { body });
+			setTimeout(()=> n.close(), 4000);
+		}
+	}
+
+	// ======= Events =======
+	startPauseBtn.addEventListener('click', () => state.running? pauseTimer() : startTimer());
+	skipBtn.addEventListener('click', () => { state.running=false; finishPhase(); });
+	resetBtn.addEventListener('click', () => { resetTimer(); updateCycleLabel(); });
+
+	modeButtons.forEach(btn => btn.addEventListener('click', () => {
+		const target = btn.dataset.mode;
+		if(state.mode === target) return;
+		state.mode = target;
+		state.running = false; cancelAnimationFrame(rafId);
+		state.startAt = null; state.endAt = null;
+		if(target==='focus'){} else if(target==='short'){} else if(target==='long'){}
+		highlightMode(target);
+		setTimeDisplay(modeDurationMs(target));
+		updateCycleLabel();
+		startPauseBtn.textContent = 'Start';
+		startPauseBtn.setAttribute('aria-pressed','false');
+	}));
+
+	Object.values(inputs).forEach(el => el.addEventListener('change', () => {
+		settings = readInputs(); saveSettings();
+		// wenn nicht laufend: Anzeige aktualisieren
+		if(!state.running){ setTimeDisplay(modeDurationMs(state.mode)); updateCycleLabel(); }
+	}));
+
+	document.addEventListener('visibilitychange', () => {
+		// korrigiere Timer, falls Tab im Hintergrund war
+		if(state.running){ tick(); }
+	});
+
+	// Keyboard shortcuts
+	document.addEventListener('keydown', (e) => {
+		if(e.code === 'Space'){ e.preventDefault(); state.running ? pauseTimer() : startTimer(); }
+		if(e.key.toLowerCase() === 'r'){ resetTimer(); updateCycleLabel(); }
+		if(e.key.toLowerCase() === 'n'){ state.running=false; finishPhase(); }
+		if(e.key === '1'){ modeButtons[0].click(); }
+		if(e.key === '2'){ modeButtons[1].click(); }
+		if(e.key === '3'){ modeButtons[2].click(); }
+	});
+
+	// Utility
+	function minutesToMs(m){ return Math.round(m*60*1000); }
+</script>
 </body>
 </html>
